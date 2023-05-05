@@ -1,8 +1,6 @@
-# SuperFastPython.com
-# example of using the queue with processes
 from time import sleep
 from random import random
-from multiprocessing import Process
+from multiprocessing import Manager, Process
 from multiprocessing import Queue
 from multiprocessing.pool import Pool
 from queue import Empty
@@ -17,7 +15,7 @@ def github_worker(in_queue, out_queue):
                 case "STOP":
                     print("exiting github_worker", flush=True)
                     break
-                case "POST":
+                case "JENKINS_JOB_DONE":
                     print("posting back to github", flush=True)
         except Empty:
             with open('github.txt') as f:
@@ -30,24 +28,29 @@ def github_worker(in_queue, out_queue):
                 f.write("")
     print('Producer: Done', flush=True)
 
-# jenkings job executed in a worker thread
+# jenkins job executed in a worker thread
 def run_jenkins_job(stop_queue, out_queue):
-    print(f'Starting a jenkins job')
-    for i in range(10):
-        print("jenkins_job is running: " + i)
-        item = stop_queue.get(block=False)
-        if item == "STOP":
-            print("stopping jenkins_job", flush=True)
-            break
-        sleep(1)
-    # report a message
-    print(f'Task done')
-    out_queue.put("JENKINS_JOB_DONE")
+    try:
+        print(f'Starting a jenkins job')
+        for i in range(10):
+            print("jenkins_job is running {}".format(i))
+            try:
+                item = stop_queue.get(block=False)
+                if item == "STOP":
+                    print("stopping jenkins_job", flush=True)
+                    break
+            except Empty:
+                print()
+            sleep(1)
+        # report a message
+        print(f'Task done')
+        out_queue.put("JENKINS_JOB_DONE")
+    except Exception as e:
+        print(e)
 
-def jenkins_spawner(in_queue, out_queue):
+def jenkins_spawner(in_queue, out_queue, job_stop_queue):
     print("start jenkins_spawner")
     pool = Pool(processes=4)
-    job_stop_queue = Queue()
     stopped = False
     while(True):
         try:
@@ -60,8 +63,11 @@ def jenkins_spawner(in_queue, out_queue):
                     stopped = True
                     break
                 case "RUN":
-                    pool.apply_async(run_jenkins_job, args=(job_stop_queue, out_queue))
                     print("creating jenkins job", flush=True)
+                    try:
+                        pool.apply_async(run_jenkins_job, args=(job_stop_queue, out_queue))
+                    except Exception as e:
+                        print(e)
                 case _:
                     print("unknown command: " + item)
 
@@ -74,20 +80,26 @@ def jenkins_spawner(in_queue, out_queue):
             with open('jenkins.txt', 'w') as f:
                 f.write("")
     print('waiting for jenkins jobs to finish', flush=True)
+    pool.close()
     pool.join()
     print('jenkins_spawner: Done', flush=True)
 
-def service(queue):
-    github_process_queue = Queue()
+def service():
+    m = Manager()
+    queue = m.Queue()
+
+    github_process_queue = m.Queue()
     github_process = Process(target=github_worker, args=(github_process_queue, queue))
     github_process.start()
 
-    jenkins_process_queue = Queue()
-    jenkins_process = Process(target=jenkins_spawner, args=(jenkins_process_queue, queue))
+    job_stop_queue = m.Queue()
+    jenkins_process_queue = m.Queue()
+    jenkins_process = Process(target=jenkins_spawner, args=(jenkins_process_queue, queue, job_stop_queue))
     jenkins_process.start()
 
     while True:
         item = queue.get()
+        print("Service, processing " + item)
         match item:
             case "STOP":
                 print("service: exiting service", flush=True)
@@ -99,8 +111,8 @@ def service(queue):
             case "RUN":
                 print("service: starting jenkins job", flush=True)
                 jenkins_process_queue.put("RUN")
-            case "RESULT":
-                jenkins_process_queue.put("RESULT")
+            case "JENKINS_JOB_DONE":
+                github_process_queue.put("JENKINS_JOB_DONE")
             case _:
                 print("service: unknown event: " + item)
     # all done
@@ -108,7 +120,6 @@ def service(queue):
 
 # entry point
 if __name__ == '__main__':
-    queue = Queue()
-    service_process = Process(target=service, args=(queue,))
+    service_process = Process(target=service)
     service_process.start()
     service_process.join()
